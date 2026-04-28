@@ -17,15 +17,15 @@ Shape parameters mirror the last (largest) case from
 The dense (non-varlen) path is exercised; chunk_size=64 routes to
 `merge_16x16_to_64x64_inverse_kernel`.
 
-Only depends on `fla.ops.utils.solve_tril`; the reference uses `torch.inverse`.
+Per-OP timings come from torch.profiler via `fla.ops.perf_utils.profile_fn`.
 """
 
 import os
 
 import torch
 import torch.nn.functional as F
-from torch.profiler import ProfilerActivity, profile, record_function
 
+from fla.ops.perf_utils import profile_fn
 from fla.ops.utils.solve_tril import solve_tril
 
 B = 4
@@ -36,8 +36,8 @@ KDIM = 64              # inner dim used to construct a well-conditioned A
 DTYPE = torch.float32
 DEVICE = "cuda"
 
-WARMUP = 20
-ITERS = 100
+WARMUP = 5
+ITERS = 20
 
 TRACE_PATH = os.environ.get(
     "FLA_PERF_TRACE",
@@ -75,56 +75,6 @@ def build_inputs() -> tuple[torch.Tensor, torch.Tensor]:
     return A_in, ref
 
 
-def benchmark(label: str, A_in: torch.Tensor, ref: torch.Tensor) -> float:
-    """Warmup, then time `solve_tril` with cuda events. Returns median ms."""
-    tri = solve_tril(A_in)
-    torch.testing.assert_close(tri, ref, rtol=1e-3, atol=1e-3)
-
-    for _ in range(WARMUP):
-        solve_tril(A_in)
-    torch.cuda.synchronize()
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
-    for i in range(ITERS):
-        starts[i].record()
-        solve_tril(A_in)
-        ends[i].record()
-    torch.cuda.synchronize()
-
-    times_ms = sorted(a.elapsed_time(b) for a, b in zip(starts, ends))
-    median_ms = times_ms[len(times_ms) // 2]
-
-    # Each chunk inverts a BT x BT lower-triangular matrix; cost dominated by
-    # the 16x16 -> 64x64 merge mat-muls. Report effective throughput as the
-    # number of BT x BT inversions per second.
-    n_chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
-    inv_per_s = (B * H * n_chunks) / (median_ms * 1e-3)
-    print(f"  [{label}] median latency: {median_ms:.4f} ms  "
-          f"throughput: {inv_per_s / 1e6:.2f} M chunk-inverses/s")
-    return median_ms
-
-
-def profile_case(label: str, A_in: torch.Tensor, trace_path: str) -> None:
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-    ) as prof:
-        for _ in range(ITERS):
-            with record_function(f"solve_tril[{label}]"):
-                solve_tril(A_in)
-        torch.cuda.synchronize()
-
-    print(f"=== profile [{label}] (top by self_cuda_time_total) ===")
-    print(prof.key_averages().table(
-        sort_by="self_cuda_time_total",
-        row_limit=10,
-        max_name_column_width=80,
-    ))
-    prof.export_chrome_trace(trace_path)
-    print(f"chrome trace: {trace_path}")
-
-
 def main() -> None:
     assert torch.cuda.is_available(), "CUDA required"
     name = torch.cuda.get_device_name()
@@ -137,8 +87,14 @@ def main() -> None:
     A_in, ref = build_inputs()
     print(f"A_in shape: {tuple(A_in.shape)}  dtype: {A_in.dtype}")
 
-    benchmark("solve_tril", A_in, ref)
-    profile_case("solve_tril", A_in, trace_path=TRACE_PATH)
+    tri = solve_tril(A_in)
+    torch.testing.assert_close(tri, ref, rtol=1e-3, atol=1e-3)
+
+    profile_fn(
+        solve_tril, A_in,
+        label="solve_tril", warmup=WARMUP, iters=ITERS,
+        trace_path=TRACE_PATH,
+    )
 
 
 if __name__ == "__main__":

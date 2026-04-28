@@ -17,16 +17,15 @@ Shape parameters mirror the last (largest) case from
 The varlen path is used (B=1, bf16). Both `g=None` and `g != None` branches are
 exercised.
 
-Only depends on `fla.ops.common.chunk_scaled_dot_kkt`; the reference
-implementation is inlined.
+Per-OP timings come from torch.profiler via `fla.ops.perf_utils.profile_fn`.
 """
 
 import os
 
 import torch
-from torch.profiler import ProfilerActivity, profile, record_function
 
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from fla.ops.perf_utils import profile_fn
 
 H = 4
 D = 128
@@ -36,8 +35,8 @@ CU_SEQLENS_LIST = [0, 200, 512, 1200, 2048]
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 
-WARMUP = 20
-ITERS = 100
+WARMUP = 5
+ITERS = 20
 
 TRACE_PATH = os.environ.get(
     "FLA_PERF_TRACE",
@@ -102,83 +101,6 @@ def ref_chunk_scaled_dot_kkt_varlen(
     return A
 
 
-def n_chunks_total(cu_seqlens: list[int], chunk_size: int) -> int:
-    return sum(
-        ((cu_seqlens[i + 1] - cu_seqlens[i]) + chunk_size - 1) // chunk_size
-        for i in range(len(cu_seqlens) - 1)
-    )
-
-
-def benchmark(
-    label: str,
-    k: torch.Tensor,
-    beta: torch.Tensor,
-    g: torch.Tensor | None,
-    cu_seqlens: torch.Tensor,
-) -> float:
-    """Warmup, then time `chunk_scaled_dot_kkt_fwd` with cuda events. Returns median ms."""
-    ref = ref_chunk_scaled_dot_kkt_varlen(k, beta, g, cu_seqlens, CHUNK_SIZE)
-    tri = chunk_scaled_dot_kkt_fwd(
-        k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
-    ).float()
-    torch.testing.assert_close(tri, ref, rtol=5e-2, atol=5e-2)
-
-    for _ in range(WARMUP):
-        chunk_scaled_dot_kkt_fwd(
-            k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
-        )
-    torch.cuda.synchronize()
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
-    for i in range(ITERS):
-        starts[i].record()
-        chunk_scaled_dot_kkt_fwd(
-            k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
-        )
-        ends[i].record()
-    torch.cuda.synchronize()
-
-    times_ms = sorted(a.elapsed_time(b) for a, b in zip(starts, ends))
-    median_ms = times_ms[len(times_ms) // 2]
-
-    NT = n_chunks_total(CU_SEQLENS_LIST, CHUNK_SIZE)
-    flops = 2.0 * H * NT * (CHUNK_SIZE ** 2) * D
-    tflops = flops / (median_ms * 1e-3) / 1e12
-    print(f"  [{label}] median latency: {median_ms:.4f} ms  "
-          f"effective MMA: {tflops:.2f} TFLOP/s  (L20 bf16 peak ≈ 119 TFLOP/s)")
-    return median_ms
-
-
-def profile_case(
-    label: str,
-    k: torch.Tensor,
-    beta: torch.Tensor,
-    g: torch.Tensor | None,
-    cu_seqlens: torch.Tensor,
-    trace_path: str,
-) -> None:
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-    ) as prof:
-        for _ in range(ITERS):
-            with record_function(f"chunk_scaled_dot_kkt_fwd[{label}]"):
-                chunk_scaled_dot_kkt_fwd(
-                    k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
-                )
-        torch.cuda.synchronize()
-
-    print(f"=== profile [{label}] (top by self_cuda_time_total) ===")
-    print(prof.key_averages().table(
-        sort_by="self_cuda_time_total",
-        row_limit=10,
-        max_name_column_width=80,
-    ))
-    prof.export_chrome_trace(trace_path)
-    print(f"chrome trace: {trace_path}")
-
-
 def main() -> None:
     assert torch.cuda.is_available(), "CUDA required"
     name = torch.cuda.get_device_name()
@@ -200,16 +122,28 @@ def main() -> None:
     g = torch.rand(1, T, H, dtype=DTYPE, device=DEVICE).log().cumsum(dim=1)
 
     print("\n--- no gate (USE_G=False) ---")
-    benchmark("no_gate", k, beta, None, cu_seqlens)
-    profile_case(
-        "no_gate", k, beta, None, cu_seqlens,
+    ref_ng = ref_chunk_scaled_dot_kkt_varlen(k, beta, None, cu_seqlens, CHUNK_SIZE)
+    tri_ng = chunk_scaled_dot_kkt_fwd(
+        k=k, g=None, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
+    ).float()
+    torch.testing.assert_close(tri_ng, ref_ng, rtol=5e-2, atol=5e-2)
+    profile_fn(
+        chunk_scaled_dot_kkt_fwd,
+        k=k, g=None, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
+        label="no_gate", warmup=WARMUP, iters=ITERS,
         trace_path=TRACE_PATH.replace(".json", ".no_gate.json"),
     )
 
     print("\n--- gated (USE_G=True) ---")
-    benchmark("gated", k, beta, g, cu_seqlens)
-    profile_case(
-        "gated", k, beta, g, cu_seqlens,
+    ref_g = ref_chunk_scaled_dot_kkt_varlen(k, beta, g, cu_seqlens, CHUNK_SIZE)
+    tri_g = chunk_scaled_dot_kkt_fwd(
+        k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
+    ).float()
+    torch.testing.assert_close(tri_g, ref_g, rtol=5e-2, atol=5e-2)
+    profile_fn(
+        chunk_scaled_dot_kkt_fwd,
+        k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
+        label="gated", warmup=WARMUP, iters=ITERS,
         trace_path=TRACE_PATH.replace(".json", ".gated.json"),
     )
 

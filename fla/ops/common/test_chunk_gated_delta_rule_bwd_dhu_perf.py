@@ -30,9 +30,11 @@ Per-OP timings come from torch.profiler via `fla.ops.perf_utils.profile_fn`.
 import os
 
 import torch
+import torch.nn.functional as F
 
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu
 from fla.ops.perf_utils import profile_fn
+from fla.ops.utils import chunk_local_cumsum
 
 H = 4
 HV = 4
@@ -56,18 +58,23 @@ TRACE_PATH = os.environ.get(
 )
 
 
-def _build_inputs(B: int, T: int, N: int) -> dict:
+def _build_inputs(B: int, T: int, N: int, cu_seqlens: torch.Tensor | None = None) -> dict:
     torch.manual_seed(42)
-    q = torch.randn(B, T, H, D, dtype=DTYPE, device=DEVICE)
-    k = torch.randn(B, T, H, D, dtype=DTYPE, device=DEVICE)
-    w = torch.randn(B, T, HV, D, dtype=DTYPE, device=DEVICE)
+    # Magnitudes mirror what the production caller feeds the bwd_dhu kernel.
+    # The reverse recurrence b_dh += b_q @ b_do * scale - b_w @ b_dv couples
+    # b_dh back into b_dv, so unit-variance bf16 inputs blow up over T=2048.
+    # L2-normalized q/k and a small w match the stable production regime.
+    q = F.normalize(torch.randn(B, T, H, D, dtype=torch.float32, device=DEVICE), p=2, dim=-1).to(DTYPE)
+    k = F.normalize(torch.randn(B, T, H, D, dtype=torch.float32, device=DEVICE), p=2, dim=-1).to(DTYPE)
+    w = (torch.randn(B, T, HV, D, dtype=torch.float32, device=DEVICE) * 0.1).to(DTYPE)
     do = torch.randn(B, T, HV, D, dtype=DTYPE, device=DEVICE)
     dv = torch.randn(B, T, HV, D, dtype=DTYPE, device=DEVICE)
-    # g must be fp32: kernels feed it to tl.exp/exp2 which reject bf16; in
-    # production it comes from chunk_local_cumsum (output_dtype=torch.float).
-    g = torch.rand(B, T, HV, dtype=torch.float32, device=DEVICE).log().cumsum(dim=1)
-    h0 = torch.randn(N, HV, D, D, dtype=torch.float32, device=DEVICE)
-    dht = torch.randn(N, HV, D, D, dtype=torch.float32, device=DEVICE)
+    # g must be fp32 and chunk-local cumulative, matching production
+    # (g = chunk_local_cumsum(logits, chunk_size=BT)).
+    g_raw = F.logsigmoid(torch.randn(B, T, HV, dtype=torch.float32, device=DEVICE))
+    g = chunk_local_cumsum(g_raw, chunk_size=BT, cu_seqlens=cu_seqlens)
+    h0 = torch.randn(N, HV, D, D, dtype=torch.float32, device=DEVICE) * 0.1
+    dht = torch.randn(N, HV, D, D, dtype=torch.float32, device=DEVICE) * 0.1
     return {"q": q, "k": k, "w": w, "do": do, "dv": dv, "g": g, "h0": h0, "dht": dht}
 
 
@@ -126,7 +133,7 @@ def main() -> None:
     # T = CU_SEQLENS_LIST[-1]
     # N = len(CU_SEQLENS_LIST) - 1
     # cu_seqlens = torch.tensor(CU_SEQLENS_LIST, dtype=torch.int32, device=DEVICE)
-    # varlen = _build_inputs(1, T, N=N)
+    # varlen = _build_inputs(1, T, N=N, cu_seqlens=cu_seqlens)
     # run_case("varlen_with_g_with_h0_with_dht", varlen, with_g=True, with_h0=True, with_dht=True, cu_seqlens=cu_seqlens)
 
 

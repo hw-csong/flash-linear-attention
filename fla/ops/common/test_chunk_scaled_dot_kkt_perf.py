@@ -11,11 +11,20 @@ Performance test for `chunk_scaled_dot_kkt_fwd` on NVIDIA L20.
 Run as a script:
     python fla/ops/common/test_chunk_scaled_dot_kkt_perf.py
 
-Shape parameters mirror the last (largest) case from
-`tests/ops/test_solve_tril.py::test_solve_tril_varlen`:
-    H=4, D=128, chunk_size=32, cu_seqlens=[0, 200, 512, 1200, 2048]
-The varlen path is used (B=1, bf16). Both `g=None` and `g != None` branches are
-exercised.
+Covers the only Triton kernel reached by `chunk_scaled_dot_kkt_fwd`:
+    `chunk_scaled_dot_kkt_fwd_kernel`
+across the meaningful constexpr branches that aren't varlen:
+    - USE_G : g is None vs. provided
+
+Shapes mirror the largest representative dense cases from `tests/ops/`:
+    - USE_G=False : `tests/ops/test_delta.py::test_chunk` largest case
+        (B=4, T=2048, H=HV=8, D=64, dtype=fp16)
+        — delta_rule's chunk path calls `chunk_scaled_dot_kkt_fwd` with g=None.
+    - USE_G=True  : `tests/ops/test_gated_delta_product.py::test_chunk`
+        largest case (B=2, T=2048, H=HV=8, D=128, dtype=fp16)
+        — gated_delta_product's chunk path passes a non-None `g`.
+
+varlen paths are intentionally skipped per task scope.
 
 Per-OP timings come from torch.profiler via `fla.ops.perf_utils.profile_fn`.
 """
@@ -27,12 +36,14 @@ import torch
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.perf_utils import profile_fn
 
-H = 4
-D = 128
-CHUNK_SIZE = 32
-CU_SEQLENS_LIST = [0, 200, 512, 1200, 2048]
+BT = 64
 
-DTYPE = torch.bfloat16
+# `tests/ops/test_delta.py::test_chunk` largest dense case.
+NO_GATE = dict(B=4, T=2048, H=8, HV=8, K=64)
+# `tests/ops/test_gated_delta_product.py::test_chunk` largest dense case.
+GATED = dict(B=2, T=2048, H=8, HV=8, K=128)
+
+DTYPE = torch.float16
 DEVICE = "cuda"
 
 WARMUP = 5
@@ -44,7 +55,7 @@ TRACE_PATH = os.environ.get(
 )
 
 
-def _ref_chunk_scaled_dot_kkt_dense(
+def _ref_chunk_scaled_dot_kkt(
     k: torch.Tensor,
     beta: torch.Tensor,
     g: torch.Tensor | None,
@@ -76,29 +87,36 @@ def _ref_chunk_scaled_dot_kkt_dense(
     return A
 
 
-def ref_chunk_scaled_dot_kkt_varlen(
-    k: torch.Tensor,
-    beta: torch.Tensor,
-    g: torch.Tensor | None,
-    cu_seqlens: torch.Tensor,
-    chunk_size: int,
-) -> torch.Tensor:
-    """Apply the dense reference to each sub-sequence carved out by `cu_seqlens`."""
-    B_, T_, _, _ = k.shape
-    HV_ = beta.shape[2]
-    assert B_ == 1, "varlen requires batch size 1"
-    A = torch.zeros(1, T_, HV_, chunk_size, dtype=torch.float32, device=k.device)
-    bnds = cu_seqlens.tolist()
-    for i in range(len(bnds) - 1):
-        bos, eos = bnds[i], bnds[i + 1]
-        if eos == bos:
-            continue
-        seq_g = g[:, bos:eos] if g is not None else None
-        seq_A = _ref_chunk_scaled_dot_kkt_dense(
-            k[:, bos:eos], beta[:, bos:eos], seq_g, chunk_size,
-        )
-        A[:, bos:eos] = seq_A
-    return A
+def run_case(label: str, shape: dict, *, with_g: bool) -> None:
+    print(f"\n========== {label} ==========")
+    B, T, H, HV, K = shape["B"], shape["T"], shape["H"], shape["HV"], shape["K"]
+    print(f"B={B} T={T} H={H} HV={HV} K={K} BT={BT} dtype={DTYPE}")
+
+    torch.manual_seed(42)
+    # Mirror tests/ops/test_solve_tril.py: k is L2-normalized along the last dim.
+    k = torch.nn.functional.normalize(
+        torch.randn((B, T, H, K), dtype=DTYPE, device=DEVICE), dim=-1,
+    )
+    beta = torch.randn((B, T, HV), dtype=DTYPE, device=DEVICE).sigmoid()
+    g = (
+        torch.rand(B, T, HV, dtype=DTYPE, device=DEVICE).log().cumsum(dim=1)
+        if with_g else None
+    )
+
+    ref = _ref_chunk_scaled_dot_kkt(k, beta, g, BT)
+    tri = chunk_scaled_dot_kkt_fwd(
+        k=k, g=g, beta=beta, chunk_size=BT,
+    ).float()
+    torch.testing.assert_close(tri, ref, rtol=5e-2, atol=5e-2)
+
+    profile_fn(
+        chunk_scaled_dot_kkt_fwd,
+        k=k, g=g, beta=beta, chunk_size=BT,
+        label=label,
+        warmup=WARMUP,
+        iters=ITERS,
+        trace_path=TRACE_PATH.replace(".json", f".{label}.json"),
+    )
 
 
 def main() -> None:
@@ -107,45 +125,9 @@ def main() -> None:
     print(f"GPU: {name}")
     if "L20" not in name:
         print(f"  (target machine is L20; running on '{name}')")
-    print(f"H={H} D={D} BT={CHUNK_SIZE} cu_seqlens={CU_SEQLENS_LIST} dtype={DTYPE}")
 
-    T = CU_SEQLENS_LIST[-1]
-    cu_seqlens = torch.tensor(CU_SEQLENS_LIST, dtype=torch.int32, device=DEVICE)
-
-    torch.manual_seed(42)
-    # Mirror test_solve_tril_varlen: k is L2-normalized along the last dim.
-    k = torch.nn.functional.normalize(
-        torch.randn((1, T, H, D), dtype=DTYPE, device=DEVICE), dim=-1,
-    )
-    beta = torch.randn((1, T, H), dtype=DTYPE, device=DEVICE).sigmoid()
-    # Gate values are log-decays in (-inf, 0]; cumulative-summed before this kernel.
-    g = torch.rand(1, T, H, dtype=DTYPE, device=DEVICE).log().cumsum(dim=1)
-
-    print("\n--- no gate (USE_G=False) ---")
-    ref_ng = ref_chunk_scaled_dot_kkt_varlen(k, beta, None, cu_seqlens, CHUNK_SIZE)
-    tri_ng = chunk_scaled_dot_kkt_fwd(
-        k=k, g=None, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
-    ).float()
-    torch.testing.assert_close(tri_ng, ref_ng, rtol=5e-2, atol=5e-2)
-    profile_fn(
-        chunk_scaled_dot_kkt_fwd,
-        k=k, g=None, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
-        label="no_gate", warmup=WARMUP, iters=ITERS,
-        trace_path=TRACE_PATH.replace(".json", ".no_gate.json"),
-    )
-
-    print("\n--- gated (USE_G=True) ---")
-    ref_g = ref_chunk_scaled_dot_kkt_varlen(k, beta, g, cu_seqlens, CHUNK_SIZE)
-    tri_g = chunk_scaled_dot_kkt_fwd(
-        k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
-    ).float()
-    torch.testing.assert_close(tri_g, ref_g, rtol=5e-2, atol=5e-2)
-    profile_fn(
-        chunk_scaled_dot_kkt_fwd,
-        k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, chunk_size=CHUNK_SIZE,
-        label="gated", warmup=WARMUP, iters=ITERS,
-        trace_path=TRACE_PATH.replace(".json", ".gated.json"),
-    )
+    run_case("no_gate", NO_GATE, with_g=False)
+    run_case("gated", GATED, with_g=True)
 
 
 if __name__ == "__main__":

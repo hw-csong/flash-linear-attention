@@ -16,9 +16,12 @@ Covers every Triton kernel reached by `solve_tril`, dispatched by `BT`:
     - `merge_16x16_to_32x32_inverse_kernel`  (BT=32)
     - `merge_16x16_to_64x64_inverse_kernel`  (BT=64)
 
-Shapes mirror the largest representative case from
+For each `BT` we use the largest case at that `chunk_size` from
 `tests/ops/test_solve_tril.py::test_solve_tril`:
-    B=4 T=2048 H=8 (dtype=fp32, varlen paths skipped per task scope)
+    BT=16: B=1 T=63   H=1
+    BT=32: B=2 T=500  H=4
+    BT=64: B=4 T=2048 H=8
+    DK=64 (matches the reference test) and dtype=fp32.
 
 The input `A` is constructed exactly like the reference test: the strict
 lower-triangular part of a per-chunk Gram matrix of an L2-normalised tensor,
@@ -35,9 +38,13 @@ import torch.nn.functional as F
 from fla.ops.perf_utils import profile_fn
 from fla.ops.utils.solve_tril import solve_tril
 
-B = 4
-T = 2048
-H = 8
+# Per-BT shape picked as the largest case at that chunk_size from
+# tests/ops/test_solve_tril.py::test_solve_tril.
+SHAPES_PER_BT: dict[int, dict[str, int]] = {
+    16: dict(B=1, T=63,   H=1),
+    32: dict(B=2, T=500,  H=4),
+    64: dict(B=4, T=2048, H=8),
+}
 DK = 64
 
 DTYPE = torch.float32
@@ -52,8 +59,10 @@ TRACE_PATH = os.environ.get(
 )
 
 
-def _build_A(chunk_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Construct (A, ref_inverse) following `tests/ops/test_solve_tril.py`."""
+def _build_A(chunk_size: int) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
+    """Construct (A, ref_inverse, shape) following `tests/ops/test_solve_tril.py`."""
+    shape = SHAPES_PER_BT[chunk_size]
+    B, T, H = shape["B"], shape["T"], shape["H"]
     torch.manual_seed(42)
     k = F.normalize(
         torch.randn((B, H, T, DK), dtype=DTYPE, device=DEVICE),
@@ -69,13 +78,13 @@ def _build_A(chunk_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     ref = ref.reshape(B, H, -1, chunk_size)[:, :, :T, :]
 
     A = A_full.reshape(B, H, -1, chunk_size)[:, :, :T, :].transpose(1, 2).contiguous()
-    return A, ref
+    return A, ref, shape
 
 
 def run_case(chunk_size: int) -> None:
     label = f"BT{chunk_size}"
-    print(f"\n========== {label} ==========")
-    A, ref = _build_A(chunk_size)
+    A, ref, shape = _build_A(chunk_size)
+    print(f"\n========== {label} (B={shape['B']} T={shape['T']} H={shape['H']} DK={DK}) ==========")
 
     tri = solve_tril(A).transpose(1, 2)
     torch.testing.assert_close(tri.to(ref.dtype), ref, rtol=1e-3, atol=1e-3)
@@ -96,7 +105,7 @@ def main() -> None:
     print(f"GPU: {name}")
     if "L20" not in name:
         print(f"  (target machine is L20; running on '{name}')")
-    print(f"B={B} T={T} H={H} DK={DK} dtype={DTYPE}")
+    print(f"DK={DK} dtype={DTYPE}")
 
     for chunk_size in (16, 32, 64):
         run_case(chunk_size)

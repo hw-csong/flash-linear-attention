@@ -150,13 +150,22 @@ def _profile_fn_npu(
     warmup: int,
     iters: int,
     trace_path: str | None,
-    row_limit: int,
-    sort_by: str,
+    row_limit: int,  # unused on NPU; per-OP breakdown lives in the trace dir
+    sort_by: str,    # unused on NPU
     **kwargs: Any,
-) -> Any:
+) -> None:
+    """
+    NPU profile path: drives `torch_npu.profiler.profile` and writes a
+    tensorboard trace dir. Per-OP timings are read offline from the trace
+    (open with TensorBoard or the Ascend MindStudio analysis tools);
+    `torch_npu.profiler.profile` does not expose an in-memory
+    `key_averages()` table the way `torch.profiler.profile` does.
+    """
     import torch_npu  # noqa: F401  (registers torch.npu and the NPU profiler backend)
     from torch_npu.profiler import ProfilerActivity as NpuActivity
     from torch_npu.profiler import profile as npu_profile
+
+    del row_limit, sort_by  # silence unused
 
     label = label or fn.__name__
     record_label = f"{fn.__name__}[{label}]"
@@ -174,21 +183,11 @@ def _profile_fn_npu(
         activities=[NpuActivity.CPU, NpuActivity.NPU],
         record_shapes=True,
         on_trace_ready=on_trace_ready,
-    ) as prof:
+    ):
         for _ in range(iters):
             with record_function(record_label):
                 fn(*args, **kwargs)
         torch.npu.synchronize()
 
-    npu_sort_by = sort_by.replace("cuda", "npu") if "cuda" in sort_by else sort_by
-
-    averages = prof.key_averages()
-    print(f"=== profile [{label}] (top {row_limit} by {npu_sort_by}, iters={iters}, backend=npu) ===")
-    print(averages.table(
-        sort_by=npu_sort_by,
-        row_limit=row_limit,
-        max_name_column_width=80,
-    ))
     if trace_path:
-        print(f"npu trace dir: {trace_path}")
-    return averages
+        print(f"[{label}] npu trace dir: {trace_path}")
